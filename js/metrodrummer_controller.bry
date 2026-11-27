@@ -1,0 +1,533 @@
+from browser import window, document, aio, html
+
+SERVICE_UUID = "7b2e0001-6d4a-4f8b-9c3d-123456789001"
+CHAR_UUID = "7b2e0002-6d4a-4f8b-9c3d-123456789001"
+
+PEDALS = [
+    {"id": 0, "name": "Pedal 1", "gpio": "GPIO 25"},
+    {"id": 1, "name": "Pedal 2", "gpio": "GPIO 26"},
+    {"id": 2, "name": "Pedal 3", "gpio": "GPIO 27"},
+    {"id": 3, "name": "Pedal 4", "gpio": "GPIO 33"},
+    {"id": 4, "name": "Pedal 5", "gpio": "GPIO 32"},
+    {"id": 5, "name": "Pedal 6", "gpio": "GPIO 14"},
+    {"id": 6, "name": "Pedal 7", "gpio": "GPIO 13"},
+]
+
+DEFAULT_CODES = [0, 4, 5, 8, 9, 9, 9]
+
+# Matches ESP32 internal function codes 0..10
+FUNCTION_OPTIONS = [
+    ("0", "0: Start / Stop (Enter)"),
+    ("1", "1: Intro (Key 1)"),
+    ("2", "2: Standard (Key 2)"),
+    ("3", "3: Variation (Key 3)"),
+    ("4", "4: Fill to Standard (Key 4)"),
+    ("5", "5: Fill to Variation (Key 5)"),
+    ("6", "6: Ending (Key 6)"),
+    ("7", "7: Percussion On/Off (Key 7)"),
+    ("8", "8: Restart (Keypad 00)"),
+    ("9", "9: Not assigned"),
+    ("10", "10: Not assigned"),
+]
+
+selects_by_pedal = {}
+ble_device = None
+ble_char = None
+loaded_codes = list(DEFAULT_CODES)
+has_unsaved_changes = False
+is_connecting = False
+is_testing = False
+
+
+def get_el(elem_id):
+    try:
+        return document[elem_id]
+    except KeyError:
+        return None
+
+
+def log_step(msg, is_error=False, is_success=False):
+    if is_error:
+        window.console.error("[BLE]", msg)
+    else:
+        window.console.log("[BLE]", msg)
+
+    toast = get_el("statusToast")
+    if toast is not None:
+        toast.text = msg
+        if is_error:
+            toast.class_name = "toast error"
+        elif is_success:
+            toast.class_name = "toast success"
+        else:
+            toast.class_name = "toast"
+
+
+def render_connection_hint(show=True):
+    hint = get_el("bleConnectionHint")
+    if hint is None:
+        connect_btn = get_el("connectBtn")
+        if connect_btn is None or connect_btn.parent is None:
+            return
+        hint = html.DIV(id="bleConnectionHint", Class="ble-hint")
+        hint.style = {
+            "marginTop": "8px",
+            "fontSize": "0.9rem",
+            "lineHeight": "1.4",
+        }
+        connect_btn.parent <= hint
+
+    if not show:
+        hint.clear()
+        hint.style.display = "none"
+        return
+
+    hint.clear()
+    hint <= html.P(
+        [
+            html.STRONG("Before connecting: "),
+            "Disconnect MetroDrummer Controller from your phone or other Bluetooth devices first. ",
+            "If another device is connected, the browser may not list or connect to it for configuration.",
+        ],
+        style={"margin": "0"},
+    )
+    hint.style.display = "block"
+
+
+def render_pedal_test_hint():
+    grid = get_el("pedalGrid")
+    if grid is None or grid.parent is None:
+        return
+
+    note = get_el("pedalTestNote")
+    if note is None:
+        note = html.P(
+            id="pedalTestNote",
+            Class="pedal-test-note",
+            style={
+                "margin": "0 0 10px 0",
+                "fontSize": "0.9rem",
+                "lineHeight": "1.4",
+            },
+        )
+        grid.parent.insertBefore(note, grid)
+
+    note.clear()
+    note <= [
+        html.STRONG("How to test: "),
+        "Click ",
+        html.EM("Test"),
+        " for a single click-and-release signal, or step and release the physical pedal to test its selected function once.",
+    ]
+
+
+def check_web_bluetooth_support():
+    bt = getattr(window.navigator, "bluetooth", None)
+    warning = get_el("browserWarning")
+    connect_btn = get_el("connectBtn")
+
+    if bt is not None:
+        if warning is not None:
+            warning.clear()
+            warning.style.display = "none"
+        if connect_btn is not None:
+            connect_btn.disabled = False
+        render_connection_hint(True)
+        return True
+
+    if connect_btn is not None:
+        connect_btn.disabled = True
+    render_connection_hint(False)
+
+    if warning is not None:
+        warning.clear()
+        warning <= html.DIV(
+            [
+                html.STRONG("Web Bluetooth is not available or not enabled in this browser."),
+                html.P(
+                    "To connect to MetroDrummer Controller, follow these steps:",
+                    style={"margin": "6px 0"},
+                ),
+                html.OL(
+                    [
+                        html.LI([
+                            "Use a Web Bluetooth supported browser (such as Google Chrome or Microsoft Edge) and open ",
+                            html.CODE("https://smallalley2001.github.io/metrodrummer_controller/"),
+                            ".",
+                        ]),
+                        html.LI([
+                            "If using a Chromium-based browser (especially on Linux), open ",
+                            html.CODE("chrome://flags"),
+                            " or ",
+                            html.CODE("edge://flags"),
+                            ", enable Web Bluetooth / Experimental Web Platform features, and restart the browser.",
+                        ]),
+                        html.LI(
+                            "Ensure Bluetooth is turned on in your operating system and browser permissions are allowed."
+                        ),
+                    ],
+                    style={"margin": "0", "paddingLeft": "20px"},
+                ),
+            ]
+        )
+        warning.style.display = "block"
+
+    log_step(
+        "Web Bluetooth is unavailable. Open https://smallalley2001.github.io/metrodrummer_controller/ in a supported browser and enable Web Bluetooth.",
+        is_error=True,
+    )
+    return False
+
+
+def get_current_ui_codes():
+    codes = []
+    for pedal in PEDALS:
+        pid = pedal["id"]
+        sel = selects_by_pedal.get(pid)
+        try:
+            val = int(sel.value) if sel is not None else 9
+        except (ValueError, TypeError):
+            val = 9
+        codes.append(val)
+    return codes
+
+
+def update_unsaved_badge():
+    global has_unsaved_changes
+    current = get_current_ui_codes()
+    has_unsaved_changes = (current != loaded_codes)
+
+    badge = get_el("unsavedBadge")
+    if badge is not None:
+        if has_unsaved_changes:
+            badge.class_name = "badge-unsaved visible"
+        else:
+            badge.class_name = "badge-unsaved"
+
+
+def set_connected_ui(connected, name="Not connected"):
+    dot = get_el("statusDot")
+    dev_label = get_el("deviceName")
+    if dot is not None:
+        dot.class_name = "dot connected" if connected else "dot"
+    if dev_label is not None:
+        dev_label.text = name
+
+    connect_btn = get_el("connectBtn")
+    if connect_btn is not None:
+        connect_btn.disabled = connected or (getattr(window.navigator, "bluetooth", None) is None)
+        connect_btn.style.display = "none" if connected else ""
+
+    render_connection_hint(not connected and (getattr(window.navigator, "bluetooth", None) is not None))
+
+    for btn_id in ("defaultsBtn", "cancelBtn", "saveBtn"):
+        btn = get_el(btn_id)
+        if btn is not None:
+            btn.disabled = not connected
+
+
+def apply_codes_to_ui(codes):
+    for idx, pedal in enumerate(PEDALS):
+        pid = pedal["id"]
+        sel = selects_by_pedal.get(pid)
+        if sel is not None and idx < len(codes):
+            sel.value = str(codes[idx])
+    update_unsaved_badge()
+
+
+def flash_pedal_card(pedal_num):
+    idx = pedal_num - 1
+    if idx < 0 or idx >= len(PEDALS):
+        return
+
+    card = get_el(f"pedalCard_{idx}")
+    ind = get_el(f"hwInd_{idx}")
+    if card is not None:
+        card.class_name = "pedal-card pressed"
+    if ind is not None:
+        ind.text = "Stepped"
+        ind.class_name = "hw-indicator active"
+
+    def _reset_visual():
+        if card is not None:
+            card.class_name = "pedal-card"
+        if ind is not None:
+            ind.text = "Step pedal to test"
+            ind.class_name = "hw-indicator"
+
+    window.setTimeout(_reset_visual, 350)
+
+
+def parse_csv_codes(payload):
+    parts = [p.strip() for p in payload.split(",")]
+    if len(parts) != len(PEDALS):
+        return None
+    codes = []
+    for p in parts:
+        val = int(p)
+        if val < 0 or val > 10:
+            return None
+        codes.append(val)
+    return codes
+
+
+async def send_ble_command(cmd_str):
+    if ble_char is None:
+        log_step("Not connected to BLE characteristic.", is_error=True)
+        return False
+
+    encoder = window.TextEncoder.new()
+    data = encoder.encode(cmd_str)
+    await ble_char.writeValue(data)
+    return True
+
+
+async def _send_single_test(pedal_num, code_str, source_label):
+    global is_testing
+    if is_testing:
+        return
+    if code_str in ("9", "10"):
+        log_step(f"Pedal {pedal_num} is set to Not assigned.")
+        return
+
+    is_testing = True
+    try:
+        log_step(f"{source_label} Pedal {pedal_num} (code {code_str}) — single pulse sent.")
+        await send_ble_command(f"TEST:{code_str}")
+    except Exception as exc:
+        err_name = getattr(exc, "name", type(exc).__name__)
+        err_msg = getattr(exc, "message", str(exc))
+        log_step(f"Test failed -> {err_name}: {err_msg}", is_error=True)
+    finally:
+        is_testing = False
+
+
+def on_ble_notify(event):
+    global loaded_codes
+    target = getattr(event, "target", None)
+    value = getattr(target, "value", None)
+    if value is None:
+        return
+
+    decoder = window.TextDecoder.new("utf-8")
+    msg = decoder.decode(value).strip()
+    window.console.log("[BLE NOTIFY]", msg)
+
+    if msg.startswith("CFG:"):
+        parsed = parse_csv_codes(msg[4:])
+        if parsed is not None:
+            loaded_codes = list(parsed)
+            apply_codes_to_ui(loaded_codes)
+            log_step("Loaded configuration from MetroDrummer Controller.", is_success=True)
+        else:
+            log_step(f"Invalid CFG payload: {msg}", is_error=True)
+
+    elif msg.startswith("SAVED:"):
+        parsed = parse_csv_codes(msg[6:])
+        if parsed is not None:
+            loaded_codes = list(parsed)
+            apply_codes_to_ui(loaded_codes)
+            log_step("Configuration saved on ESP32.", is_success=True)
+        else:
+            log_step(f"Invalid SAVED payload: {msg}", is_error=True)
+
+    elif msg.startswith("PEDAL:"):
+        try:
+            pedal_num = int(msg[6:].strip())
+            flash_pedal_card(pedal_num)
+            idx = pedal_num - 1
+            sel = selects_by_pedal.get(idx)
+            if sel is not None:
+                aio.run(_send_single_test(pedal_num, sel.value, "Stepped"))
+        except ValueError:
+            pass
+
+    elif msg == "TEST:OK":
+        window.console.log("[BLE] Single test pulse confirmed by ESP32.")
+
+    elif msg == "PONG":
+        log_step("PONG received from ESP32.", is_success=True)
+
+    elif msg.startswith("ERROR:"):
+        log_step(f"ESP32 error: {msg}", is_error=True)
+
+
+def make_select_handler():
+    def _on_change(event):
+        update_unsaved_badge()
+    return _on_change
+
+
+def make_test_handler(pid):
+    def _on_test(event):
+        sel = selects_by_pedal.get(pid)
+        if sel is None or is_testing:
+            return
+        aio.run(_send_single_test(pid + 1, sel.value, "Tested"))
+    return _on_test
+
+
+def on_defaults_click(event):
+    apply_codes_to_ui(DEFAULT_CODES)
+    log_step("Defaults loaded in UI. Click 'Save to Pedal' to store.")
+
+
+def on_cancel_click(event):
+    apply_codes_to_ui(loaded_codes)
+    log_step("Reverted changes to last loaded configuration.")
+
+
+def on_save_click(event):
+    aio.run(_run_save())
+
+
+async def _run_save():
+    codes = get_current_ui_codes()
+    csv_str = ",".join(str(c) for c in codes)
+    try:
+        log_step("Saving pedal configuration to ESP32...")
+        await send_ble_command(f"SAVE:{csv_str}")
+    except Exception as exc:
+        err_name = getattr(exc, "name", type(exc).__name__)
+        err_msg = getattr(exc, "message", str(exc))
+        log_step(f"Save failed -> {err_name}: {err_msg}", is_error=True)
+
+
+def on_gatt_disconnected(event):
+    global ble_char
+    ble_char = None
+    set_connected_ui(False, "Not connected")
+    check_web_bluetooth_support()
+    log_step(
+        "Disconnected from MetroDrummer Controller. Ensure no other device (such as a phone) is connected before reconnecting.",
+        is_error=True,
+    )
+
+
+def render_pedals():
+    render_pedal_test_hint()
+    grid = get_el("pedalGrid")
+    if grid is None:
+        log_step("Missing #pedalGrid element in index.html", is_error=True)
+        return
+
+    grid.clear()
+    selects_by_pedal.clear()
+    on_sel_change = make_select_handler()
+
+    for pedal in PEDALS:
+        pid = pedal["id"]
+        card = html.DIV(Class="pedal-card", id=f"pedalCard_{pid}")
+
+        header_div = html.DIV(Class="pedal-header")
+        header_div <= html.SPAN(pedal["name"], Class="pedal-title")
+        header_div <= html.SPAN(pedal["gpio"], Class="pedal-gpio")
+
+        sel = html.SELECT(id=f"pedalSelect_{pid}")
+        for val, label in FUNCTION_OPTIONS:
+            opt = html.OPTION(label, value=val)
+            if int(val) == DEFAULT_CODES[pid]:
+                opt.selected = True
+            sel <= opt
+        sel.bind("change", on_sel_change)
+        selects_by_pedal[pid] = sel
+
+        footer_div = html.DIV(Class="pedal-footer")
+        hw_ind = html.SPAN("Step pedal to test", Class="hw-indicator", id=f"hwInd_{pid}")
+        test_btn = html.BUTTON("Test", Class="test-btn", id=f"testBtn_{pid}")
+        test_btn.bind("click", make_test_handler(pid))
+
+        footer_div <= hw_ind
+        footer_div <= test_btn
+
+        card <= header_div
+        card <= sel
+        card <= footer_div
+        grid <= card
+
+    update_unsaved_badge()
+
+
+def on_connect_click(event):
+    if not is_connecting and check_web_bluetooth_support():
+        aio.run(_connect_ble())
+
+
+async def _connect_ble():
+    global ble_device, ble_char, is_connecting
+    if is_connecting:
+        return
+    if not check_web_bluetooth_support():
+        return
+
+    is_connecting = True
+    step = "init"
+    try:
+        step = "requestDevice"
+        log_step(
+            "Step 1/4: Opening Bluetooth chooser (disconnect from your phone or other devices first if not listed)..."
+        )
+        device = await window.navigator.bluetooth.requestDevice({
+            "filters": [{"name": "MetroDrummer Controller"}],
+            "optionalServices": [SERVICE_UUID],
+        })
+
+        if ble_device is None:
+            device.addEventListener("gattserverdisconnected", on_gatt_disconnected)
+        ble_device = device
+        log_step(f"Device selected: {device.name} ({device.id})")
+
+        step = "gatt.connect"
+        log_step("Step 2/4: Connecting to GATT server...")
+        server = await device.gatt.connect()
+        log_step("GATT server connected.")
+
+        step = "getPrimaryService"
+        log_step("Step 3/4: Fetching config service...")
+        service = await server.getPrimaryService(SERVICE_UUID)
+        log_step("Primary service acquired.")
+
+        step = "getCharacteristic"
+        log_step("Step 4/4: Fetching config characteristic...")
+        ble_char = await service.getCharacteristic(CHAR_UUID)
+
+        await ble_char.startNotifications()
+        ble_char.addEventListener("characteristicvaluechanged", on_ble_notify)
+
+        set_connected_ui(True, device.name or "MetroDrummer Controller")
+        log_step("Connected. Requesting current configuration...")
+        await send_ble_command("GET")
+
+    except Exception as exc:
+        err_name = getattr(exc, "name", type(exc).__name__)
+        err_msg = getattr(exc, "message", str(exc))
+        ble_char = None
+        set_connected_ui(False, "Not connected")
+        log_step(
+            f"Failed at [{step}] -> {err_name}: {err_msg}. Disconnect other Bluetooth devices (like your phone) if needed.",
+            is_error=True,
+        )
+
+    finally:
+        is_connecting = False
+
+
+set_connected_ui(False, "Not connected")
+render_pedals()
+check_web_bluetooth_support()
+
+connect_btn = get_el("connectBtn")
+if connect_btn is not None:
+    connect_btn.bind("click", on_connect_click)
+
+defaults_btn = get_el("defaultsBtn")
+if defaults_btn is not None:
+    defaults_btn.bind("click", on_defaults_click)
+
+cancel_btn = get_el("cancelBtn")
+if cancel_btn is not None:
+    cancel_btn.bind("click", on_cancel_click)
+
+save_btn = get_el("saveBtn")
+if save_btn is not None:
+    save_btn.bind("click", on_save_click)
