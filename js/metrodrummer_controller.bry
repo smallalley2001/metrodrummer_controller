@@ -36,7 +36,6 @@ ble_char = None
 loaded_codes = list(DEFAULT_CODES)
 has_unsaved_changes = False
 is_connecting = False
-is_testing = False
 
 
 def get_el(elem_id):
@@ -85,25 +84,26 @@ def render_connection_hint(show=True):
     hint.clear()
     hint <= html.P(
         [
-            html.STRONG("Before connecting: "),
-            "Disconnect MetroDrummer Controller from your phone or other Bluetooth devices first. ",
-            "If another device is connected, the browser may not list or connect to it for configuration.",
+            html.STRONG("Before & after configuring: "),
+            "Disconnect MetroDrummer Controller from your phone first so the browser can connect. ",
+            "After finishing and closing this page, if pedals do not respond in the MetroDrummer app, ",
+            "Forget/Unpair MetroDrummer Controller in your phone's Bluetooth settings and re-pair it.",
         ],
         style={"margin": "0"},
     )
     hint.style.display = "block"
 
 
-def render_pedal_test_hint():
+def render_pedal_step_hint():
     grid = get_el("pedalGrid")
     if grid is None or grid.parent is None:
         return
 
-    note = get_el("pedalTestNote")
+    note = get_el("pedalStepNote")
     if note is None:
         note = html.P(
-            id="pedalTestNote",
-            Class="pedal-test-note",
+            id="pedalStepNote",
+            Class="pedal-step-note",
             style={
                 "margin": "0 0 10px 0",
                 "fontSize": "0.9rem",
@@ -114,10 +114,8 @@ def render_pedal_test_hint():
 
     note.clear()
     note <= [
-        html.STRONG("How to test: "),
-        "Click ",
-        html.EM("Test"),
-        " for a single click-and-release signal, or step and release the physical pedal to test its selected function once.",
+        html.STRONG("Pedal identification: "),
+        "Step a physical pedal while connected to highlight its card and dropdown list so you know which pedal you are configuring.",
     ]
 
 
@@ -242,20 +240,24 @@ def flash_pedal_card(pedal_num):
 
     card = get_el(f"pedalCard_{idx}")
     ind = get_el(f"hwInd_{idx}")
+    sel = selects_by_pedal.get(idx)
+
     if card is not None:
         card.class_name = "pedal-card pressed"
+    if sel is not None:
+        sel.focus()
     if ind is not None:
-        ind.text = "Stepped"
+        ind.text = "Active pedal"
         ind.class_name = "hw-indicator active"
 
     def _reset_visual():
         if card is not None:
             card.class_name = "pedal-card"
         if ind is not None:
-            ind.text = "Step pedal to test"
+            ind.text = "Ready"
             ind.class_name = "hw-indicator"
 
-    window.setTimeout(_reset_visual, 350)
+    window.setTimeout(_reset_visual, 500)
 
 
 def parse_csv_codes(payload):
@@ -269,37 +271,6 @@ def parse_csv_codes(payload):
             return None
         codes.append(val)
     return codes
-
-
-async def send_ble_command(cmd_str):
-    if ble_char is None:
-        log_step("Not connected to BLE characteristic.", is_error=True)
-        return False
-
-    encoder = window.TextEncoder.new()
-    data = encoder.encode(cmd_str)
-    await ble_char.writeValue(data)
-    return True
-
-
-async def _send_single_test(pedal_num, code_str, source_label):
-    global is_testing
-    if is_testing:
-        return
-    if code_str in ("9", "10"):
-        log_step(f"Pedal {pedal_num} is set to Not assigned.")
-        return
-
-    is_testing = True
-    try:
-        log_step(f"{source_label} Pedal {pedal_num} (code {code_str}) — single pulse sent.")
-        await send_ble_command(f"TEST:{code_str}")
-    except Exception as exc:
-        err_name = getattr(exc, "name", type(exc).__name__)
-        err_msg = getattr(exc, "message", str(exc))
-        log_step(f"Test failed -> {err_name}: {err_msg}", is_error=True)
-    finally:
-        is_testing = False
 
 
 def on_ble_notify(event):
@@ -335,15 +306,9 @@ def on_ble_notify(event):
         try:
             pedal_num = int(msg[6:].strip())
             flash_pedal_card(pedal_num)
-            idx = pedal_num - 1
-            sel = selects_by_pedal.get(idx)
-            if sel is not None:
-                aio.run(_send_single_test(pedal_num, sel.value, "Stepped"))
+            log_step(f"Pedal {pedal_num} stepped.")
         except ValueError:
             pass
-
-    elif msg == "TEST:OK":
-        window.console.log("[BLE] Single test pulse confirmed by ESP32.")
 
     elif msg == "PONG":
         log_step("PONG received from ESP32.", is_success=True)
@@ -352,19 +317,21 @@ def on_ble_notify(event):
         log_step(f"ESP32 error: {msg}", is_error=True)
 
 
+async def send_ble_command(cmd_str):
+    if ble_char is None:
+        log_step("Not connected to BLE characteristic.", is_error=True)
+        return False
+
+    encoder = window.TextEncoder.new()
+    data = encoder.encode(cmd_str)
+    await ble_char.writeValue(data)
+    return True
+
+
 def make_select_handler():
     def _on_change(event):
         update_unsaved_badge()
     return _on_change
-
-
-def make_test_handler(pid):
-    def _on_test(event):
-        sel = selects_by_pedal.get(pid)
-        if sel is None or is_testing:
-            return
-        aio.run(_send_single_test(pid + 1, sel.value, "Tested"))
-    return _on_test
 
 
 def on_defaults_click(event):
@@ -399,13 +366,13 @@ def on_gatt_disconnected(event):
     set_connected_ui(False, "Not connected")
     check_web_bluetooth_support()
     log_step(
-        "Disconnected from MetroDrummer Controller. Ensure no other device (such as a phone) is connected before reconnecting.",
+        "Disconnected. If switching back to your phone/app and pedals do not respond, Forget/Unpair and re-pair MetroDrummer Controller.",
         is_error=True,
     )
 
 
 def render_pedals():
-    render_pedal_test_hint()
+    render_pedal_step_hint()
     grid = get_el("pedalGrid")
     if grid is None:
         log_step("Missing #pedalGrid element in index.html", is_error=True)
@@ -433,12 +400,8 @@ def render_pedals():
         selects_by_pedal[pid] = sel
 
         footer_div = html.DIV(Class="pedal-footer")
-        hw_ind = html.SPAN("Step pedal to test", Class="hw-indicator", id=f"hwInd_{pid}")
-        test_btn = html.BUTTON("Test", Class="test-btn", id=f"testBtn_{pid}")
-        test_btn.bind("click", make_test_handler(pid))
-
+        hw_ind = html.SPAN("Ready", Class="hw-indicator", id=f"hwInd_{pid}")
         footer_div <= hw_ind
-        footer_div <= test_btn
 
         card <= header_div
         card <= sel
